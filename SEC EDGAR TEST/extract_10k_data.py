@@ -1,34 +1,31 @@
 import os
 import requests
-import csv
+import pymysql
 import time
+import webbrowser
+import tempfile
 from datetime import datetime
+
+
 
 # SEC API Base URL
 SEC_API_BASE = "https://www.sec.gov"
 
 # Required Headers
 HEADERS = {
-    "User-Agent": "your-email@example.com"
+    "User-Agent": "jackbian0903@gmail.com"
 }
 
-# Directory for storing filings
-SAVE_DIR = "SEC_Filings"
-os.makedirs(SAVE_DIR, exist_ok=True)
-
-# Metadata file path
-METADATA_FILE = os.path.join(SAVE_DIR, "filings_metadata.csv")
-
+# Database Credentials
+DB_HOST = "siai-financial-data.cds66i4yidxk.us-east-2.rds.amazonaws.com"
+DB_USER = "admin"
+DB_PASSWORD = "123321123"
+DB_NAME = "siai_financial_data"
 
 def get_cik_from_ticker(ticker: str):
-    """
-    Retrieves the CIK number from the company ticker symbol.
-    :param ticker: Stock ticker symbol (e.g., AAPL, MSFT)
-    :return: Corresponding CIK number as a string or None if not found
-    """
+    """ Retrieves the CIK number from the ticker symbol. """
     ticker = ticker.upper()
     cik_url = "https://www.sec.gov/files/company_tickers.json"
-
     try:
         response = requests.get(cik_url, headers=HEADERS, timeout=10)
         response.raise_for_status()
@@ -36,21 +33,54 @@ def get_cik_from_ticker(ticker: str):
     except requests.exceptions.RequestException as e:
         print(f"❌ Error fetching CIK data: {e}")
         return None
-
     for entry in cik_data.values():
         if entry["ticker"] == ticker:
-            cik = str(entry["cik_str"]).zfill(10)  # Format CIK as a 10-digit string
+            cik = str(entry["cik_str"]).zfill(10)
             print(f"✅ Found CIK for {ticker}: {cik}")
             return cik
-
     print(f"⚠️ No CIK found for ticker {ticker}")
     return None
 
 
-def get_filing(cik: str, ticker: str, year: int, form_type: str):
-    """
-    Fetches the specified filing (10-K or 10-Q) for a given company's CIK and year.
-    """
+def check_filing_in_db(filing_key):
+    """ Checks if the filing exists in the database and optionally displays it in a browser. """
+    try:
+        conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT file_content FROM sec_filings WHERE filing_key = %s", (filing_key,))
+        result = cursor.fetchone()
+
+        conn.close()
+
+        if result:
+            print(f"✅ Filing found in database for {filing_key}. No need to fetch from API.")
+
+            # Ask user if they want to open the file in the browser
+            choice = input("Would you like to display the HTML file in a browser? (y/n): ").strip().lower()
+
+            if choice == "y":
+                # Create a temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as temp_file:
+                    temp_file.write(result[0])  # Write HTML content
+                    temp_path = temp_file.name  # Get the file path
+
+                # Open the HTML file in the default web browser
+                webbrowser.open(f"file://{temp_path}")
+                print(f"🌍 Opening {filing_key} in browser...")
+
+            return result[0]  # Returns the stored HTML content
+        else:
+            print(f"❌ Filing not found in database: {filing_key}")
+            return None
+
+    except Exception as e:
+        print(f"❌ Database connection error: {e}")
+        return None
+
+
+def fetch_and_store_filing(cik, ticker, year, form_type):
+    """ Fetches the filing from SEC, stores it in the database, and optionally opens it in the browser. """
     filings_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
 
     try:
@@ -63,7 +93,6 @@ def get_filing(cik: str, ticker: str, year: int, form_type: str):
     data = response.json()
     filings = data.get("filings", {}).get("recent", {})
 
-    # Look for the correct filing
     for i, form in enumerate(filings.get("form", [])):
         filing_date = filings.get("filingDate", [])[i]
         filing_year = int(filing_date.split("-")[0]) if filing_date else None
@@ -73,117 +102,127 @@ def get_filing(cik: str, ticker: str, year: int, form_type: str):
             primary_doc = filings["primaryDocument"][i]
             filing_url = f"{SEC_API_BASE}/Archives/edgar/data/{cik}/{accession_number}/{primary_doc}"
 
-            return {
-                "company_cik": cik,
-                "ticker": ticker,
-                "filing_year": filing_year,
-                "form_type": form_type,
-                "filing_url": filing_url
-            }
+            try:
+                response = requests.get(filing_url, headers=HEADERS, timeout=15)
+                response.raise_for_status()
+                html_content = response.text  # Fetch actual HTML content
+
+                # Determine filing key
+                filing_key = f"{ticker}_{year}" if form_type == "10-K" else f"{ticker}_{year}_{i+1}"
+
+                # Store in DB
+                store_filing_in_db(filing_key, ticker, year, form_type, html_content)
+
+                print(f"✅ {form_type} filing for {ticker} saved in DB")
+
+                # Ask user if they want to open the file in the browser
+                choice = input("Would you like to display the newly stored HTML file in a browser? (y/n): ").strip().lower()
+                if choice == "y":
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as temp_file:
+                        temp_file.write(html_content)  # Write HTML content
+                        temp_path = temp_file.name  # Get the file path
+
+                    # Open the HTML file in the default web browser
+                    webbrowser.open(f"file://{temp_path}")
+                    print(f"🌍 Opening {filing_key} in browser...")
+
+                return html_content  # Return the stored HTML content
+
+            except requests.exceptions.RequestException as e:
+                print(f"❌ Error fetching {form_type} for {ticker}: {e}")
+                return None
 
     print(f"⚠️ No {form_type} filing found for {ticker} ({cik}) in {year}.")
     return None
 
 
-def save_filing(filing_data):
-    """
-    Downloads and saves the filing document.
-    """
-    if not filing_data:
-        return
 
-    ticker = filing_data["ticker"]
-    filing_year = filing_data["filing_year"]
-    form_type = filing_data["form_type"]
-    filing_url = filing_data["filing_url"]
-
+def store_filing_in_db(filing_key, company, year, filing_type, file_content):
+    """ Stores the fetched SEC filing in the database. """
     try:
-        response = requests.get(filing_url, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Error fetching {form_type} for {ticker}: {e}")
-        return
+        conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO sec_filings (filing_key, company, year, filing_type, file_content)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE file_content = VALUES(file_content)
+            """,
+            (filing_key, company, year, filing_type, file_content)
+        )
+        conn.commit()
+        conn.close()
+        print(f"✅ Filing stored successfully in database: {filing_key}")
+    except Exception as e:
+        print(f"❌ Error storing filing in database: {e}")
 
-    # Define file path for saving
-    filename = f"{ticker}_{filing_year}_{form_type}.html"
-    filepath = os.path.join(SAVE_DIR, filename)
+def validate_user_input():
+    """Ensures the user enters a valid year and a properly formatted form type."""
+    current_year = datetime.now().year
 
-    # Save the document
-    with open(filepath, "wb") as f:
-        f.write(response.content)
+    while True:
+        try:
+            year = int(input("Enter the filing year (e.g., 2023): ").strip())
 
-    print(f"✅ {form_type} saved as {filepath}")
+            # Check for incorrect years like 20221
+            if year < 1995 or year > current_year:
+                print(f"⚠️ Invalid year: {year}. Please enter a valid year (1995 - {current_year}).")
+                continue  # Ask again
 
-    # Store metadata
-    save_metadata(filing_data, filepath)
+            break  # Valid year, exit loop
 
+        except ValueError:
+            print("⚠️ Please enter a valid numeric year.")
+    
+    while True:
+        form_type = input("Enter the form type (10-K or 10-Q): ").strip().upper()
 
-def save_metadata(filing_data, filepath):
-    """
-    Stores metadata in a CSV file to keep track of all filings.
-    """
-    csv_file = METADATA_FILE
-    file_exists = os.path.isfile(csv_file)
+        # Normalize variations of 10-K and 10-Q
+        if form_type in ["10K", "10-K", "10k"]:
+            form_type = "10-K"
+        elif form_type in ["10Q", "10-Q", "10q"]:
+            form_type = "10-Q"
+        else:
+            print("⚠️ Invalid form type. Please enter '10-K' or '10-Q'.")
+            continue  # Ask again
+        
+        break  # Valid form type, exit loop
 
-    # Read existing metadata quickly to avoid duplication
-    existing_entries = set()
-    if file_exists:
-        with open(csv_file, "r", newline="") as f:
-            reader = csv.reader(f)
-            next(reader, None)  # Skip header
-            for row in reader:
-                existing_entries.add((row[0], row[2], row[3]))  # (Ticker, Filing Year, Form Type)
-
-    # Append new data only if it's not already in the file
-    if (filing_data["ticker"], str(filing_data["filing_year"]), filing_data["form_type"]) not in existing_entries:
-        with open(csv_file, "a", newline="") as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["Ticker", "CIK", "Filing Year", "Form Type", "File Path", "URL"])
-            writer.writerow([
-                filing_data["ticker"],
-                filing_data["company_cik"],
-                filing_data["filing_year"],
-                filing_data["form_type"],
-                filepath,
-                filing_data["filing_url"]
-            ])
-    else:
-        print(f"⚠️ Metadata already exists for {filing_data['ticker']} ({filing_data['filing_year']} - {filing_data['form_type']}). Skipping.")
-
+    return year, form_type
 
 def main():
-    """
-    Main function to fetch SEC filings for any company.
-    """
+    """ Main function to check SEC filings in the DB before fetching. """
     while True:
         try:
             company_input = input("Enter the company ticker or CIK: ").strip().upper()
-            year = int(input("Enter the filing year (e.g., 2023): "))
-            form_type = input("Enter the form type (10-K or 10-Q): ").strip().upper()
+            year, form_type = validate_user_input()  # Get validated input
 
-            if form_type not in ["10-K", "10-Q"]:
-                print("⚠️ Invalid form type. Please enter '10-K' or '10-Q'.")
-                continue
-
-            # Determine CIK
             cik = company_input if company_input.isdigit() else get_cik_from_ticker(company_input)
 
             if not cik:
                 print("⚠️ Unable to determine CIK. Please enter a valid ticker or CIK.")
                 continue
 
-            break  # Exit loop when valid input is received
+            filing_key = f"{company_input}_{year}" if form_type == "10-K" else f"{company_input}_{year}_1"
+
+            # Check DB first
+            existing_filing = check_filing_in_db(filing_key)
+
+            if existing_filing:
+                print(f"📄 Retrieved filing from DB:\n{existing_filing[:500]}...")  # Show preview
+            else:
+                print(f"🔍 Fetching filing from SEC API...")
+                new_filing = fetch_and_store_filing(cik, company_input, year, form_type)
+                if new_filing:
+                    print(f"📄 Retrieved newly stored filing:\n{new_filing[:500]}...")  # Show preview
+
+            break  # Exit loop if successful
+
         except ValueError:
-            print("⚠️ Please enter a valid year.")
+            print("⚠️ Unexpected error. Please try again.")
 
-    # Fetch and save the filing
-    filing_data = get_filing(cik, company_input, year, form_type)
-    if filing_data:
-        save_filing(filing_data)
-
-        # Avoid hitting SEC rate limits
-        time.sleep(1)
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
